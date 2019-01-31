@@ -22,12 +22,13 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"github.com/ontio/ontology/common/constants"
 	"io/ioutil"
 	"math"
 	"math/big"
 	"os"
 	"strings"
+
+	"github.com/ontio/ontology/common/constants"
 )
 
 const (
@@ -83,13 +84,9 @@ func ParseOnt(rawAmount string) uint64 {
 
 func CheckAssetAmount(asset string, amount uint64) error {
 	switch strings.ToLower(asset) {
-	case "ont":
-		if amount > constants.ONT_TOTAL_SUPPLY {
-			return fmt.Errorf("amount:%d larger than ONT total supply:%d", amount, constants.ONT_TOTAL_SUPPLY)
-		}
 	case "ong":
-		if amount > constants.ONG_TOTAL_SUPPLY {
-			return fmt.Errorf("amount:%d larger than ONG total supply:%d", amount, constants.ONG_TOTAL_SUPPLY)
+		if amount > constants.ONGX_TOTAL_SUPPLY {
+			return fmt.Errorf("amount:%d larger than ONG total supply:%d", amount, constants.ONGX_TOTAL_SUPPLY)
 		}
 	default:
 		return fmt.Errorf("unknown asset:%s", asset)

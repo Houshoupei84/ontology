@@ -28,9 +28,11 @@ import (
 	"strconv"
 	"strings"
 
+	"fmt"
 	"github.com/ontio/ontology/common/serialization"
 	"github.com/ontio/ontology/vm/wasmvm/memory"
 	"github.com/ontio/ontology/vm/wasmvm/util"
+	"golang.org/x/crypto/ripemd160"
 )
 
 type Args struct {
@@ -79,11 +81,16 @@ func NewInteropService() *InteropService {
 	service.Register("i64Subtract", int64Subtract)
 	service.Register("SHA1", hashSha1)
 	service.Register("SHA256", hashSha256)
+	service.Register("Hash160", hash160)
+	service.Register("Hash256", hash256)
 
 	//parameter apis
 	service.Register("ONT_ReadInt32Param", readInt32Param)
 	service.Register("ONT_ReadInt64Param", readInt64Param)
 	service.Register("ONT_ReadStringParam", readStringParam)
+	service.Register("ONT_ReadStringArrayParam", readStringArrayParam)
+	service.Register("ONT_ReadNestedArrayParam", readNestedArrayParam)
+	service.Register("ONT_ResetParamIdx", readresetParamIdx)
 	service.Register("ONT_JsonUnmashalInput", jsonUnmashal)
 	service.Register("ONT_JsonMashalResult", jsonMashal)
 	service.Register("ONT_JsonMashalParams", jsonMashalParams)
@@ -196,10 +203,20 @@ func arrayLen(engine *ExecutionEngine) (bool, error) {
 			result = uint64(tl.Length / 1)
 		case memory.PInt16:
 			result = uint64(tl.Length / 2)
-		case memory.PInt32, memory.PFloat32:
+		case memory.PInt32, memory.PFloat32, memory.PArray:
 			result = uint64(tl.Length / 4)
 		case memory.PInt64, memory.PFloat64:
 			result = uint64(tl.Length / 8)
+		case memory.PRawArray:
+			bs, err := engine.vm.GetPointerMemory(pointer)
+			if err != nil {
+				return false, err
+			}
+			if len(bs) < 16 {
+				return false, fmt.Errorf("Error to get length!")
+			}
+			length := binary.LittleEndian.Uint64(bs[8:16])
+			result = uint64(length)
 		case memory.PUnkown:
 			//todo assume it's byte
 			result = uint64(tl.Length / 1)
@@ -212,6 +229,7 @@ func arrayLen(engine *ExecutionEngine) (bool, error) {
 	}
 	//1. recover the vm context
 	//2. if the call returns value,push the result to the stack
+
 	engine.vm.RestoreCtx()
 	if envCall.envReturns {
 		engine.vm.pushUint64(uint64(result))
@@ -233,7 +251,6 @@ func memcpy(engine *ExecutionEngine) (bool, error) {
 	if dest < src && dest+length > src {
 		return false, errors.New("memcpy overlapped")
 	}
-
 	copy(engine.vm.memory.Memory[dest:dest+length], engine.vm.memory.Memory[src:src+length])
 
 	//1. recover the vm context
@@ -315,7 +332,6 @@ func readInt32Param(engine *ExecutionEngine) (bool, error) {
 
 //read int64 value from args bytes
 func readInt64Param(engine *ExecutionEngine) (bool, error) {
-
 	envCall := engine.vm.envCall
 	params := envCall.envParams
 	if len(params) != 1 {
@@ -337,6 +353,128 @@ func readInt64Param(engine *ExecutionEngine) (bool, error) {
 	engine.vm.RestoreCtx()
 	if envCall.envReturns {
 		engine.vm.pushUint64(retInt)
+	}
+	return true, nil
+}
+
+func readresetParamIdx(engine *ExecutionEngine) (bool, error) {
+	engine.vm.memory.ParamIndex = 0
+	engine.vm.RestoreCtx()
+	return true, nil
+}
+
+//read nested arramy value from args bytes
+func readNestedArrayParam(engine *ExecutionEngine) (bool, error) {
+	envCall := engine.vm.envCall
+	params := envCall.envParams
+	if len(params) != 1 {
+		return false, errors.New("parameter count error while call readStringArrayParam")
+	}
+	addr := params[0]
+
+	paramBytes, err := engine.vm.GetPointerMemory(addr)
+	if err != nil {
+		return false, err
+	}
+	pidx := engine.vm.memory.ParamIndex
+	if pidx+8 > len(paramBytes) {
+		return false, errors.New("read params error")
+	}
+
+	arrbyteslength := binary.LittleEndian.Uint64(paramBytes[pidx : pidx+8])
+	if pidx+8+int(arrbyteslength) > len(paramBytes) {
+		return false, errors.New("read params error")
+	}
+
+	arrlen := binary.LittleEndian.Uint64(paramBytes[pidx+8 : pidx+8+8])
+	retarr := make([]byte, 4*arrlen)
+	cidx := pidx + 16
+	for i := 0; i < int(arrlen); i++ {
+
+		sublen := int(binary.LittleEndian.Uint64(paramBytes[cidx : cidx+8]))
+
+		//idx, err := engine.vm.SetPointerMemory(paramBytes[cidx:cidx+8+sublen])
+		idx, err := engine.vm.SetPointerMemorySpecified(paramBytes[cidx:cidx+8+sublen], memory.PRawArray)
+		if err != nil {
+			return false, err
+		}
+		tmpbytes := make([]byte, 4)
+		binary.LittleEndian.PutUint32(tmpbytes, uint32(idx))
+
+		copy(retarr[i*4:(i+1)*4], tmpbytes)
+		cidx = cidx + 8 + sublen
+	}
+
+	retIdx, err := engine.vm.SetPointerMemorySpecified(retarr, memory.PArray)
+	if err != nil {
+		return false, err
+	}
+
+	engine.vm.memory.ParamIndex = pidx + 8 + int(arrbyteslength)
+	engine.vm.RestoreCtx()
+	if envCall.envReturns {
+		engine.vm.pushUint64(uint64(retIdx))
+	}
+	return true, nil
+}
+
+//read string array value from args bytes
+//add read string array system call
+func readStringArrayParam(engine *ExecutionEngine) (bool, error) {
+	envCall := engine.vm.envCall
+	params := envCall.envParams
+	if len(params) != 1 {
+		return false, errors.New("parameter count error while call readStringArrayParam")
+	}
+	addr := params[0]
+	paramBytes, err := engine.vm.GetPointerMemory(addr)
+
+	if err != nil {
+		return false, err
+	}
+	pidx := engine.vm.memory.ParamIndex
+	if pidx+8 > len(paramBytes) {
+		return false, errors.New("read params error")
+	}
+	arrbyteslength := binary.LittleEndian.Uint64(paramBytes[pidx : pidx+8])
+
+	if pidx+8+int(arrbyteslength) > len(paramBytes) {
+		return false, errors.New("read params error")
+	}
+
+	bf := bytes.NewBuffer(paramBytes[pidx+8 : pidx+8+int(arrbyteslength)])
+
+	arrlen, err := serialization.ReadUint64(bf)
+	if err != nil {
+		return false, err
+	}
+
+	retarr := make([]byte, 4*arrlen)
+
+	for i := 0; i < int(arrlen); i++ {
+
+		s, err := serialization.ReadString(bf)
+		if err != nil {
+			return false, err
+		}
+
+		idx, err := engine.vm.SetPointerMemory([]byte(s))
+
+		tmpbytes := make([]byte, 4)
+		binary.LittleEndian.PutUint32(tmpbytes, uint32(idx))
+
+		copy(retarr[i*4:(i+1)*4], tmpbytes)
+	}
+
+	retIdx, err := engine.vm.SetPointerMemory(retarr)
+	if err != nil {
+		return false, err
+	}
+
+	engine.vm.memory.ParamIndex = pidx + 8 + int(arrbyteslength)
+	engine.vm.RestoreCtx()
+	if envCall.envReturns {
+		engine.vm.pushUint64(uint64(retIdx))
 	}
 	return true, nil
 }
@@ -577,6 +715,8 @@ func jsonMashal(engine *ExecutionEngine) (bool, error) {
 			retArray[i] = strconv.FormatInt(int64(binary.LittleEndian.Uint64(tmp[i:i+8])), 10)
 		}
 		ret.Pval = strings.Join(retArray, ",")
+	case "string_array":
+		//todo
 	}
 
 	jsonstr, err := json.Marshal(ret)
@@ -748,14 +888,14 @@ func rawMashalParams(engine *ExecutionEngine) (bool, error) {
 	envCall := engine.vm.envCall
 	params := envCall.envParams
 	if len(params) != 1 {
-		return false, errors.New("[jsonMashalParams]parameter count error")
+		return false, errors.New("[rawMashalParams]parameter count error")
 	}
 
 	addr := params[0]
 
 	pBytes, err := engine.vm.GetPointerMemory(addr)
 	if err != nil {
-		return false, errors.New("[jsonMashalParams] GetPointerMemory err:" + err.Error())
+		return false, errors.New("[rawMashalParams] GetPointerMemory err:" + err.Error())
 	}
 	bf := bytes.NewBuffer(nil)
 
@@ -764,7 +904,7 @@ func rawMashalParams(engine *ExecutionEngine) (bool, error) {
 		typeIdx := binary.LittleEndian.Uint32(pBytes[i : i+4])
 		typeBytes, err := engine.vm.GetPointerMemory(uint64(typeIdx))
 		if err != nil {
-			return false, errors.New("[jsonMashalParams] GetPointerMemory err:" + err.Error())
+			return false, errors.New("[rawMashalParams] GetPointerMemory err:" + err.Error())
 		}
 
 		sType := strings.ToLower(util.TrimBuffToString(typeBytes))
@@ -786,21 +926,20 @@ func rawMashalParams(engine *ExecutionEngine) (bool, error) {
 			intBytes := uint64(binary.LittleEndian.Uint32(pBytes[i+4 : i+8]))
 			str, err := engine.vm.GetPointerMemory(intBytes)
 			if err != nil {
-				return false, errors.New("[jsonMashalParams] GetPointerMemory err:" + err.Error())
+				return false, errors.New("[rawMashalParams] GetPointerMemory err:" + err.Error())
 			}
-
 			tmp := bytes.NewBuffer(nil)
 			serialization.WriteString(tmp, util.TrimBuffToString(str))
 			bf.Write(tmp.Bytes())
 			i += 7
 		default:
-			return false, errors.New("[jsonMashalParams]  not support type :" + string(typeBytes))
+			return false, errors.New("[rawMashalParams]  not support type :" + string(typeBytes))
 		}
 
 	}
 	argIdx, err := engine.vm.SetPointerMemory(bf.Bytes())
 	if err != nil {
-		return false, errors.New("[jsonMashalParams] SetPointerMemory err:" + err.Error())
+		return false, errors.New("[rawMashalParams] SetPointerMemory err:" + err.Error())
 	}
 	engine.vm.RestoreCtx()
 	if envCall.envReturns {
@@ -853,4 +992,50 @@ func hashSha256(engine *ExecutionEngine) (bool, error) {
 	vm.RestoreCtx()
 	vm.PushResult(uint64(idx))
 	return true, nil
+}
+
+func hash160(engine *ExecutionEngine) (bool, error) {
+	vm := engine.GetVM()
+	envCall := vm.envCall
+	params := envCall.envParams
+	if len(params) != 1 {
+		return false, errors.New("[hashSha1]parameter count error")
+	}
+	item, err := vm.GetPointerMemory(params[0])
+	if err != nil {
+		return false, err
+	}
+
+	temp := sha256.Sum256(item)
+	md := ripemd160.New()
+	md.Write(temp[:])
+	bt := md.Sum(nil)
+
+	idx, err := vm.SetPointerMemory(bt)
+	vm.RestoreCtx()
+	vm.PushResult(uint64(idx))
+	return true, nil
+
+}
+
+func hash256(engine *ExecutionEngine) (bool, error) {
+	vm := engine.GetVM()
+	envCall := vm.envCall
+	params := envCall.envParams
+	if len(params) != 1 {
+		return false, errors.New("[hashSha1]parameter count error")
+	}
+	item, err := vm.GetPointerMemory(params[0])
+	if err != nil {
+		return false, err
+	}
+
+	temp := sha256.Sum256(item)
+	data := sha256.Sum256(temp[:])
+
+	idx, err := vm.SetPointerMemory(data)
+	vm.RestoreCtx()
+	vm.PushResult(uint64(idx))
+	return true, nil
+
 }

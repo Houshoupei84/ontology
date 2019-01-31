@@ -29,6 +29,9 @@ import (
 
 // int32 operators
 
+//var I32MAX uint32 = 2 ^ 32
+//var I64MAX uint64 = 2 ^ 64
+
 func (vm *VM) i32Clz() {
 	vm.pushUint64(uint64(bits.LeadingZeros32(vm.popUint32())))
 }
@@ -42,11 +45,16 @@ func (vm *VM) i32Popcnt() {
 }
 
 func (vm *VM) i32Add() {
-	vm.pushUint32(vm.popUint32() + vm.popUint32())
+
+	a := vm.popUint32()
+	b := vm.popUint32()
+	vm.pushUint32(a + b)
 }
 
 func (vm *VM) i32Mul() {
-	vm.pushUint32(vm.popUint32() * vm.popUint32())
+	a := vm.popUint32()
+	b := vm.popUint32()
+	vm.pushUint32(a * b)
 }
 
 func (vm *VM) i32DivS() {
@@ -196,7 +204,9 @@ func (vm *VM) i64Popcnt() {
 }
 
 func (vm *VM) i64Add() {
-	vm.pushUint64(vm.popUint64() + vm.popUint64())
+	a := vm.popUint64()
+	b := vm.popUint64()
+	vm.pushUint64(a + b)
 }
 
 func (vm *VM) i64Sub() {
@@ -206,7 +216,9 @@ func (vm *VM) i64Sub() {
 }
 
 func (vm *VM) i64Mul() {
-	vm.pushUint64(vm.popUint64() * vm.popUint64())
+	a := vm.popUint64()
+	b := vm.popUint64()
+	vm.pushUint64(a * b)
 }
 
 func (vm *VM) i64DivS() {

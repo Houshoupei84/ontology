@@ -33,16 +33,19 @@ import (
 	scommon "github.com/ontio/ontology/core/store/common"
 	"github.com/ontio/ontology/core/store/overlaydb"
 	"github.com/ontio/ontology/core/types"
+	utils2 "github.com/ontio/ontology/core/utils"
 	"github.com/ontio/ontology/errors"
 	"github.com/ontio/ontology/smartcontract"
 	"github.com/ontio/ontology/smartcontract/event"
 	"github.com/ontio/ontology/smartcontract/service/native/global_params"
-	ninit "github.com/ontio/ontology/smartcontract/service/native/init"
-	"github.com/ontio/ontology/smartcontract/service/native/ont"
+	_ "github.com/ontio/ontology/smartcontract/service/native/init"
+	"github.com/ontio/ontology/smartcontract/service/native/ongx"
 	"github.com/ontio/ontology/smartcontract/service/native/utils"
 	"github.com/ontio/ontology/smartcontract/service/neovm"
+	"github.com/ontio/ontology/smartcontract/states"
 	"github.com/ontio/ontology/smartcontract/storage"
 	ntypes "github.com/ontio/ontology/vm/neovm/types"
+	"github.com/ontio/ontology/vm/wasmvm/exec"
 )
 
 //HandleDeployTransaction deal with smart contract deploy transaction
@@ -63,13 +66,13 @@ func (self *StateStore) HandleDeployTransaction(store store.LedgerStore, overlay
 			Tx:        tx,
 			BlockHash: block.Hash(),
 		}
-		createGasPrice, ok := neovm.GAS_TABLE.Load(neovm.CONTRACT_CREATE_NAME)
+		createGasPrice, ok := exec.GAS_TABLE.Load(exec.CONTRACT_CREATE_NAME)
 		if !ok {
 			overlay.SetError(errors.NewErr("[HandleDeployTransaction] get CONTRACT_CREATE_NAME gas failed"))
 			return nil
 		}
 
-		uintCodePrice, ok := neovm.GAS_TABLE.Load(neovm.UINT_DEPLOY_CODE_LEN_NAME)
+		uintCodePrice, ok := exec.GAS_TABLE.Load(exec.UINT_DEPLOY_CODE_LEN_NAME)
 		if !ok {
 			overlay.SetError(errors.NewErr("[HandleDeployTransaction] get UINT_DEPLOY_CODE_LEN_NAME gas failed"))
 			return nil
@@ -121,10 +124,16 @@ func (self *StateStore) HandleInvokeTransaction(store store.LedgerStore, overlay
 	tx *types.Transaction, block *types.Block, notify *event.ExecuteNotify) error {
 	invoke := tx.Payload.(*payload.InvokeCode)
 	code := invoke.Code
-	sysTransFlag := bytes.Compare(code, ninit.COMMIT_DPOS_BYTES) == 0 || block.Header.Height == 0
-
+	sysTransFlag := block.Header.Height == 0
 	isCharge := !sysTransFlag && tx.GasPrice != 0
+	txStruct := &utils2.TxStruct{}
 
+	errs := txStruct.Deserialize(code)
+	if errs != nil {
+		return errs
+	}
+
+	//cache := storage.NewCacheDB(overlay)
 	// init smart contract configuration info
 	config := &smartcontract.Config{
 		Time:      block.Header.Timestamp,
@@ -143,10 +152,9 @@ func (self *StateStore) HandleInvokeTransaction(store store.LedgerStore, overlay
 		minGas            uint64
 		err               error
 	)
-
 	availableGasLimit = tx.GasLimit
 	if isCharge {
-		uintCodeGasPrice, ok := neovm.GAS_TABLE.Load(neovm.UINT_INVOKE_CODE_LEN_NAME)
+		uintCodeGasPrice, ok := exec.GAS_TABLE.Load(exec.UINT_INVOKE_CODE_LEN_NAME)
 		if !ok {
 			overlay.SetError(errors.NewErr("[HandleInvokeTransaction] get UINT_INVOKE_CODE_LEN_NAME gas failed"))
 			return nil
@@ -157,7 +165,7 @@ func (self *StateStore) HandleInvokeTransaction(store store.LedgerStore, overlay
 			return err
 		}
 
-		minGas = neovm.MIN_TRANSACTION_GAS * tx.GasPrice
+		minGas = exec.MIN_TRANSACTION_GAS * tx.GasPrice
 
 		if oldBalance < minGas {
 			if err := costInvalidGas(tx.Payer, oldBalance, config, overlay, store, notify); err != nil {
@@ -196,8 +204,41 @@ func (self *StateStore) HandleInvokeTransaction(store store.LedgerStore, overlay
 		Gas:     availableGasLimit - codeLenGasLimit,
 	}
 
+	address := txStruct.Address
+	if IsNativeContract(address) {
+		// startup a native service
+
+		parsedAddr, err := common.AddressParseFromBytes(txStruct.Address)
+		if err != nil {
+			return errors.NewErr("parse address error")
+		}
+		contract := states.ContractInvokeParam{
+			Version: byte(txStruct.Version),
+			Address: parsedAddr,
+			Method:  string(txStruct.Method),
+			Args:    txStruct.Args,
+		}
+
+		native, err := sc.NewNativeService()
+		native.InvokeParam = contract
+		native.Input = contract.Args
+		if err != nil {
+			return err
+		}
+		_, err = native.Invoke()
+		if err != nil {
+			return err
+		}
+		notify.Notify = append(notify.Notify, native.Notifications...)
+		notify.State = event.CONTRACT_STATE_SUCCESS
+		cache.Commit()
+
+		return nil
+
+	}
+
 	//start the smart contract executive function
-	engine, _ := sc.NewExecuteEngine(invoke.Code)
+	engine, _ := sc.NewExecuteEngine(txStruct.Args)
 
 	_, err = engine.Invoke()
 
@@ -255,7 +296,7 @@ func SaveNotify(eventStore scommon.EventStore, txHash common.Uint256, notify *ev
 }
 
 func genNativeTransferCode(from, to common.Address, value uint64) []byte {
-	transfer := ont.Transfers{States: []ont.State{{From: from, To: to, Value: value}}}
+	transfer := ongx.Transfers{States: []ongx.State{{From: from, To: to, Value: value}}}
 	tr := new(bytes.Buffer)
 	transfer.Serialize(tr)
 	return tr.Bytes()
@@ -349,7 +390,7 @@ func getBalanceFromNative(config *smartcontract.Config, cache *storage.CacheDB, 
 	}
 
 	service, _ := sc.NewNativeService()
-	result, err := service.NativeCall(utils.OngContractAddress, ont.BALANCEOF_NAME, bf.Bytes())
+	result, err := service.NativeCall(utils.OngContractAddress, ongx.BALANCEOF_NAME, bf.Bytes())
 	if err != nil {
 		return 0, err
 	}
@@ -371,4 +412,17 @@ func costInvalidGas(address common.Address, gas uint64, config *smartcontract.Co
 
 func calcGasByCodeLen(codeLen int, codeGas uint64) uint64 {
 	return uint64(codeLen/neovm.PER_UNIT_CODE_LEN) * codeGas
+}
+
+func IsNativeContract(address []byte) bool {
+
+	if bytes.Equal(address, utils.AuthContractAddress[:]) ||
+		bytes.Equal(address, utils.GovernanceContractAddress[:]) ||
+		bytes.Equal(address, utils.OngContractAddress[:]) ||
+		bytes.Equal(address, utils.OntIDContractAddress[:]) ||
+		bytes.Equal(address, utils.ParamContractAddress[:]) {
+		return true
+	}
+	return false
+
 }
